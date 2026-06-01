@@ -1,0 +1,29 @@
+name: Python smoke tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run Morse potential smoke test
+        working-directory: diatomic_morse
+        run: python morse_simulation.py --steps 10 --dt 0.1 --output /tmp/morse_simulation.csv
+
+      - name: Run N-body smoke test
+        working-directory: solar_system_n_body
+        run: python simulation.py --steps 10 --dt 1 --energy-csv /tmp/nbody_energy.csv

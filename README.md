@@ -17,6 +17,13 @@ Demonstrates:
 - Object-oriented Python
 - CLI-style workflow
 
+Run a short smoke test:
+
+```bash
+cd diatomic_morse
+python morse_simulation.py --steps 100 --dt 0.1 --output /tmp/morse_simulation.csv
+```
+
 ## Solar System N-Body Simulation
 
 `solar_system_n_body/` simulates a simplified gravitational N-body system using a velocity-Verlet style method.
@@ -27,6 +34,13 @@ Demonstrates:
 - Numerical integration
 - Data-driven initial conditions
 - Basic simulation design
+
+Run a short smoke test:
+
+```bash
+cd solar_system_n_body
+python simulation.py --steps 100 --dt 1 --energy-csv /tmp/nbody_energy.csv
+```
 
 ## Setup
 

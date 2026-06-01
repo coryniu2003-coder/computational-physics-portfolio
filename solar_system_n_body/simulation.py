@@ -1,143 +1,247 @@
-"""Velocity-Verlet N-body simulation used in the computational physics portfolio.
+"""
+Velocity Verlet integrator for a simplified solar system.
 
-The script is intentionally lightweight: it reads a simple particle file,
-integrates the system with a velocity-Verlet scheme, and can write energy and
-trajectory outputs for inspection.
+The code started from coursework scaffolding but has been rewritten so the
+structure, interfaces and documentation are suitable for a public portfolio.
 """
 
 from __future__ import annotations
 
 import argparse
-import csv
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
-import matplotlib.pyplot as plt
 import numpy as np
 
-from basic_functions import total_energy, update_all_forces, velocity_verlet_step
+from basic_functions import compute_forces_potential, compute_separations
 from particle3d import Particle3D
 
 
-G = 6.67430e-11
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--input",
+        type=Path,
+        default=Path("data/mini_system.txt"),
+        help="Initial conditions file.",
+    )
+    parser.add_argument(
+        "--steps",
+        type=int,
+        default=3650,
+        help="Number of integration steps to perform.",
+    )
+    parser.add_argument(
+        "--dt",
+        type=float,
+        default=1.0,
+        help="Timestep in days.",
+    )
+    parser.add_argument(
+        "--xyz",
+        type=Path,
+        help="Optional XYZ trajectory output file.",
+    )
+    parser.add_argument(
+        "--energy-csv",
+        type=Path,
+        help="Optional CSV file storing time and total energy.",
+    )
+    parser.add_argument(
+        "--plot",
+        action="store_true",
+        help="Show quick-look plots (requires matplotlib).",
+    )
+    return parser.parse_args()
 
 
 def load_particles(path: Path) -> list[Particle3D]:
-    """Load particles from rows: label mass x y z vx vy vz."""
     particles: list[Particle3D] = []
-    for line_number, raw_line in enumerate(path.read_text().splitlines(), start=1):
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        fields = line.split()
-        if len(fields) != 8:
-            raise ValueError(f"{path}:{line_number}: expected 8 fields, got {len(fields)}")
-        label = fields[0]
-        mass = float(fields[1])
-        position = np.array([float(v) for v in fields[2:5]], dtype=float)
-        velocity = np.array([float(v) for v in fields[5:8]], dtype=float)
-        particles.append(Particle3D(label, mass, position, velocity))
-    if not particles:
-        raise ValueError(f"No particles loaded from {path}")
+    with path.open() as handle:
+        for line in handle:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            particles.append(Particle3D.read_line(line))
     return particles
 
 
-def write_xyz_frame(handle, particles: Iterable[Particle3D], step: int) -> None:
-    particles = list(particles)
-    handle.write(f"{len(particles)}\n")
-    handle.write(f"step={step}\n")
-    for particle in particles:
-        x, y, z = particle.position
-        handle.write(f"{particle.label} {x:.10e} {y:.10e} {z:.10e}\n")
+def write_xyz_step(path: Path, particles: Iterable[Particle3D], step: int) -> None:
+    with path.open("a") as handle:
+        particles = list(particles)
+        handle.write(f"{len(particles)}\n")
+        handle.write(f"Step {step}\n")
+        for particle in particles:
+            handle.write(str(particle) + "\n")
+
+
+@dataclass
+class SimulationResult:
+    times: np.ndarray
+    energy: np.ndarray
+    positions: np.ndarray  # shape (steps, n, 3)
+    min_planet_distance: dict[str, float]
+    max_planet_distance: dict[str, float]
+    moon_distance_min: float | None
+    moon_distance_max: float | None
 
 
 def run_simulation(
     particles: list[Particle3D],
-    dt: float,
     steps: int,
-    sample_every: int,
-    energy_path: Path | None,
-    trajectory_path: Path | None,
-) -> tuple[list[float], list[float]]:
-    if sample_every <= 0:
-        raise ValueError("sample_every must be positive")
+    dt: float,
+    xyz_path: Path | None = None,
+) -> SimulationResult:
+    n = len(particles)
+    times = np.zeros(steps)
+    energy = np.zeros(steps)
+    positions = np.zeros((steps, n, 3))
 
-    update_all_forces(particles, G)
-    times: list[float] = []
-    energies: list[float] = []
+    if xyz_path:
+        xyz_path.parent.mkdir(parents=True, exist_ok=True)
+        xyz_path.write_text("")
 
-    energy_file = energy_path.open("w", newline="") if energy_path else None
-    trajectory_file = trajectory_path.open("w") if trajectory_path else None
-    try:
-        writer = None
-        if energy_file:
-            writer = csv.writer(energy_file)
-            writer.writerow(["step", "time_s", "total_energy_j"])
+    # Remove centre-of-mass drift before integration.
+    com_v = Particle3D.com_velocity(particles)
+    for particle in particles:
+        particle.velocity -= com_v
 
-        for step in range(steps + 1):
-            if step % sample_every == 0:
-                time = step * dt
-                energy = total_energy(particles, G)
-                times.append(time)
-                energies.append(energy)
-                if writer:
-                    writer.writerow([step, f"{time:.10e}", f"{energy:.10e}"])
-                if trajectory_file:
-                    write_xyz_frame(trajectory_file, particles, step)
+    separations = compute_separations(particles)
+    forces, potential = compute_forces_potential(particles, separations)
 
-            if step < steps:
-                velocity_verlet_step(particles, dt, G)
-    finally:
-        if energy_file:
-            energy_file.close()
-        if trajectory_file:
-            trajectory_file.close()
+    sun_index = next((i for i, p in enumerate(particles) if p.label.lower() == "sun"), None)
+    earth_index = next(
+        (i for i, p in enumerate(particles) if p.label.lower() == "earth"), None
+    )
+    moon_index = next(
+        (i for i, p in enumerate(particles) if p.label.lower() == "moon"), None
+    )
 
-    return times, energies
+    min_planet_distance: dict[str, float] = {}
+    max_planet_distance: dict[str, float] = {}
+    if sun_index is not None:
+        for idx, particle in enumerate(particles):
+            if idx == sun_index:
+                continue
+            min_planet_distance[particle.label] = np.inf
+            max_planet_distance[particle.label] = 0.0
+    moon_distance_min = np.inf if earth_index is not None and moon_index is not None else None
+    moon_distance_max = 0.0 if earth_index is not None and moon_index is not None else None
+
+    for step in range(steps):
+        times[step] = step * dt
+        positions[step] = np.array([p.position for p in particles])
+        energy[step] = Particle3D.total_kinetic_energy(particles) + potential
+
+        if xyz_path:
+            write_xyz_step(xyz_path, particles, step)
+
+        if sun_index is not None:
+            sun_position = particles[sun_index].position
+            for idx, particle in enumerate(particles):
+                if idx == sun_index:
+                    continue
+                distance = np.linalg.norm(particle.position - sun_position)
+                min_planet_distance[particle.label] = min(
+                    min_planet_distance[particle.label], distance
+                )
+                max_planet_distance[particle.label] = max(
+                    max_planet_distance[particle.label], distance
+                )
+
+        if earth_index is not None and moon_index is not None:
+            distance = np.linalg.norm(
+                particles[moon_index].position - particles[earth_index].position
+            )
+            moon_distance_min = min(moon_distance_min, distance)
+            moon_distance_max = max(moon_distance_max, distance)
+
+        for i, particle in enumerate(particles):
+            particle.update_position_2nd(dt, forces[i])
+
+        separations = compute_separations(particles)
+        new_forces, potential = compute_forces_potential(particles, separations)
+
+        for i, particle in enumerate(particles):
+            avg_force = 0.5 * (forces[i] + new_forces[i])
+            particle.update_velocity(dt, avg_force)
+
+        forces = new_forces
+
+    if moon_distance_min is not None and not np.isfinite(moon_distance_min):
+        moon_distance_min = None
+    if moon_distance_max is not None and moon_distance_max == 0.0:
+        moon_distance_max = None
+
+    return SimulationResult(
+        times=times,
+        energy=energy,
+        positions=positions,
+        min_planet_distance=min_planet_distance,
+        max_planet_distance=max_planet_distance,
+        moon_distance_min=moon_distance_min,
+        moon_distance_max=moon_distance_max,
+    )
 
 
-def plot_energy(times: list[float], energies: list[float], output_path: Path) -> None:
-    plt.figure(figsize=(6, 4))
-    plt.plot(times, energies, linewidth=1.5)
-    plt.xlabel("Time / s")
-    plt.ylabel("Total energy / J")
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=200)
-    plt.close()
+def write_energy_csv(path: Path, result: SimulationResult) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = np.column_stack((result.times, result.energy))
+    np.savetxt(path, data, delimiter=",", header="time_days,total_energy", comments="")
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run a small N-body simulation")
-    parser.add_argument("input", type=Path, nargs="?", default=Path("data/mini_system.txt"))
-    parser.add_argument("--dt", type=float, default=1000.0, help="Time step in seconds")
-    parser.add_argument("--steps", type=int, default=1000, help="Number of integration steps")
-    parser.add_argument("--sample-every", type=int, default=10, help="Output stride in steps")
-    parser.add_argument("--energy-csv", type=Path, default=None, help="Optional energy CSV output")
-    parser.add_argument("--trajectory", type=Path, default=None, help="Optional XYZ trajectory output")
-    parser.add_argument("--plot", type=Path, default=None, help="Optional energy plot output")
-    return parser.parse_args()
+def maybe_plot(result: SimulationResult, particles: list[Particle3D]) -> None:
+    import matplotlib.pyplot as plt
+
+    fig, axes = plt.subplots(2, 1, figsize=(8, 7), sharex=True)
+
+    earth_idx = next((i for i, p in enumerate(particles) if p.label.lower() == "earth"), None)
+    sun_idx = next((i for i, p in enumerate(particles) if p.label.lower() == "sun"), None)
+
+    if earth_idx is not None and sun_idx is not None:
+        axes[0].plot(
+            result.positions[:, earth_idx, 0] - result.positions[:, sun_idx, 0],
+            result.positions[:, earth_idx, 1] - result.positions[:, sun_idx, 1],
+            lw=1.2,
+        )
+        axes[0].set_title("Earth trajectory in the barycentric frame")
+        axes[0].set_ylabel("y / AU")
+
+    axes[1].plot(result.times, result.energy, color="tab:orange", lw=1.2)
+    axes[1].set_title("Total energy (kinetic + potential)")
+    axes[1].set_xlabel("Time / days")
+    axes[1].set_ylabel("Energy / $M_\oplus$ AU$^2$ day$^{-2}$")
+
+    fig.tight_layout()
+    plt.show()
 
 
 def main() -> None:
     args = parse_args()
     particles = load_particles(args.input)
-    times, energies = run_simulation(
-        particles=particles,
-        dt=args.dt,
-        steps=args.steps,
-        sample_every=args.sample_every,
-        energy_path=args.energy_csv,
-        trajectory_path=args.trajectory,
-    )
+    result = run_simulation(particles, steps=args.steps, dt=args.dt, xyz_path=args.xyz)
+
+    if args.energy_csv:
+        write_energy_csv(args.energy_csv, result)
 
     if args.plot:
-        plot_energy(times, energies, args.plot)
+        maybe_plot(result, particles)
 
-    drift = energies[-1] - energies[0]
-    print(f"Loaded {len(particles)} particles from {args.input}")
-    print(f"Initial energy: {energies[0]:.6e} J")
-    print(f"Final energy:   {energies[-1]:.6e} J")
-    print(f"Energy drift:   {drift:.6e} J")
+    print("Simulation complete.")
+    if result.min_planet_distance:
+        print("Closest approach to the Sun (AU):")
+        for label, distance in result.min_planet_distance.items():
+            print(f"  {label:<10} {distance: .3f}")
+    if result.max_planet_distance:
+        print("Farthest distance from the Sun (AU):")
+        for label, distance in result.max_planet_distance.items():
+            print(f"  {label:<10} {distance: .3f}")
+    if result.moon_distance_min is not None and result.moon_distance_max is not None:
+        print(
+            f"Moon-Earth distance ranged from {result.moon_distance_min:.3f} to "
+            f"{result.moon_distance_max:.3f} AU"
+        )
 
 
 if __name__ == "__main__":
